@@ -1,0 +1,195 @@
+-- 1. Data Cleaning and Validation
+WITH CleanedData AS (
+    SELECT 
+        master_id,
+        order_channel,
+        last_order_channel,
+        -- Clean and convert dates
+        TRY_CAST(first_order_date AS DATE) as first_order_date,
+        TRY_CAST(last_order_date AS DATE) as last_order_date,
+        TRY_CAST(last_order_date_online AS DATE) as last_order_date_online,
+        TRY_CAST(last_order_date_offline AS DATE) as last_order_date_offline,
+        -- Clean numeric columns
+        COALESCE(order_num_total_ever_online, 0) as order_num_total_ever_online,
+        COALESCE(order_num_total_ever_offline, 0) as order_num_total_ever_offline,
+        COALESCE(customer_value_total_ever_offline, 0) as customer_value_total_ever_offline,
+        COALESCE(customer_value_total_ever_online, 0) as customer_value_total_ever_online,
+        -- Clean categories
+        NULLIF(TRIM(interested_in_categories_12), '') as interested_in_categories_12
+    FROM customer_data
+    WHERE master_id IS NOT NULL
+),
+
+-- 2. Feature Engineering
+EnrichedData AS (
+    SELECT 
+        *,
+        -- Total orders and value
+        (order_num_total_ever_online + order_num_total_ever_offline) as total_orders,
+        (customer_value_total_ever_offline + customer_value_total_ever_online) as total_value,
+        
+        -- Average order value
+        CASE 
+            WHEN (order_num_total_ever_online + order_num_total_ever_offline) > 0 
+            THEN (customer_value_total_ever_offline + customer_value_total_ever_online) / 
+                 (order_num_total_ever_online + order_num_total_ever_offline)
+            ELSE 0 
+        END as avg_order_value,
+        
+        -- Customer lifetime days
+        DATEDIFF(day, first_order_date, last_order_date) as customer_lifetime_days,
+        
+        -- Days since last order
+        DATEDIFF(day, last_order_date, CURRENT_DATE) as days_since_last_order,
+        
+        -- Channel preference
+        CASE 
+            WHEN order_num_total_ever_online > order_num_total_ever_offline THEN 'Online'
+            WHEN order_num_total_ever_online < order_num_total_ever_offline THEN 'Offline'
+            ELSE 'Multi-channel'
+        END as channel_preference,
+        
+        -- Channel migration
+        CASE 
+            WHEN order_channel = last_order_channel THEN 'No Migration'
+            ELSE CONCAT(order_channel, ' to ', last_order_channel)
+        END as channel_migration
+    FROM CleanedData
+),
+
+-- 3. RFM Calculation
+RFMScores AS (
+    SELECT 
+        *,
+        NTILE(5) OVER (ORDER BY days_since_last_order DESC) as R,
+        NTILE(5) OVER (ORDER BY total_orders) as F,
+        NTILE(5) OVER (ORDER BY total_value) as M,
+        
+        -- Customer Segment
+        CASE 
+            WHEN NTILE(5) OVER (ORDER BY days_since_last_order DESC) >= 4 
+                 AND NTILE(5) OVER (ORDER BY total_orders) >= 4 
+                 AND NTILE(5) OVER (ORDER BY total_value) >= 4 
+            THEN 'Champions'
+            WHEN NTILE(5) OVER (ORDER BY days_since_last_order DESC) >= 3 
+                 AND NTILE(5) OVER (ORDER BY total_orders) >= 3 
+                 AND NTILE(5) OVER (ORDER BY total_value) >= 3 
+            THEN 'Loyal Customers'
+            WHEN NTILE(5) OVER (ORDER BY days_since_last_order DESC) >= 3 
+            THEN 'Active Customers'
+            WHEN NTILE(5) OVER (ORDER BY days_since_last_order DESC) >= 2 
+            THEN 'At Risk'
+            ELSE 'Lost Customers'
+        END as customer_segment
+    FROM EnrichedData
+)
+
+-- 4. Analysis Queries
+
+-- 4.1 Channel Analysis
+SELECT 
+    channel_preference,
+    COUNT(*) as customer_count,
+    AVG(total_orders) as avg_orders,
+    AVG(total_value) as avg_value,
+    AVG(avg_order_value) as avg_order_value
+FROM RFMScores
+GROUP BY channel_preference
+ORDER BY customer_count DESC;
+
+-- 4.2 Customer Segment Analysis
+SELECT 
+    customer_segment,
+    COUNT(*) as customer_count,
+    AVG(total_value) as avg_customer_value,
+    AVG(total_orders) as avg_orders,
+    AVG(days_since_last_order) as avg_recency_days
+FROM RFMScores
+GROUP BY customer_segment
+ORDER BY avg_customer_value DESC;
+
+-- 4.3 Category Interest Analysis
+SELECT 
+    interested_in_categories_12,
+    COUNT(*) as customer_count,
+    AVG(total_value) as avg_customer_value,
+    AVG(total_orders) as avg_orders,
+    COUNT(CASE WHEN customer_segment = 'Champions' THEN 1 END) as champion_count
+FROM RFMScores
+WHERE interested_in_categories_12 IS NOT NULL
+GROUP BY interested_in_categories_12
+ORDER BY customer_count DESC;
+
+-- 4.4 Channel Migration Pattern Analysis
+SELECT 
+    channel_migration,
+    COUNT(*) as customer_count,
+    AVG(total_value) as avg_customer_value,
+    AVG(customer_lifetime_days) as avg_lifetime_days
+FROM RFMScores
+GROUP BY channel_migration
+ORDER BY customer_count DESC;
+
+-- 4.5 Customer Value Trends
+SELECT 
+    customer_segment,
+    channel_preference,
+    COUNT(*) as customer_count,
+    AVG(total_value) as avg_value,
+    MIN(total_value) as min_value,
+    MAX(total_value) as max_value,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY total_value) as median_value
+FROM RFMScores
+GROUP BY customer_segment, channel_preference
+ORDER BY customer_segment, avg_value DESC;
+
+-- 4.6 Retention Analysis
+SELECT 
+    CASE 
+        WHEN days_since_last_order <= 30 THEN '0-30 days'
+        WHEN days_since_last_order <= 60 THEN '31-60 days'
+        WHEN days_since_last_order <= 90 THEN '61-90 days'
+        WHEN days_since_last_order <= 180 THEN '91-180 days'
+        ELSE 'Over 180 days'
+    END as recency_bucket,
+    COUNT(*) as customer_count,
+    AVG(total_value) as avg_customer_value,
+    COUNT(CASE WHEN channel_preference = 'Online' THEN 1 END) as online_customers,
+    COUNT(CASE WHEN channel_preference = 'Offline' THEN 1 END) as offline_customers
+FROM RFMScores
+GROUP BY 
+    CASE 
+        WHEN days_since_last_order <= 30 THEN '0-30 days'
+        WHEN days_since_last_order <= 60 THEN '31-60 days'
+        WHEN days_since_last_order <= 90 THEN '61-90 days'
+        WHEN days_since_last_order <= 180 THEN '91-180 days'
+        ELSE 'Over 180 days'
+    END
+ORDER BY 
+    CASE recency_bucket
+        WHEN '0-30 days' THEN 1
+        WHEN '31-60 days' THEN 2
+        WHEN '61-90 days' THEN 3
+        WHEN '91-180 days' THEN 4
+        ELSE 5
+    END;
+
+-- 4.7 High-Value Customer Analysis
+WITH CustomerMetrics AS (
+    SELECT 
+        *,
+        AVG(total_value) OVER () as avg_customer_value,
+        STDDEV(total_value) OVER () as stddev_customer_value
+    FROM RFMScores
+)
+SELECT 
+    master_id,
+    total_value,
+    total_orders,
+    customer_segment,
+    channel_preference,
+    interested_in_categories_12,
+    days_since_last_order
+FROM CustomerMetrics
+WHERE total_value > avg_customer_value + (2 * stddev_customer_value)
+ORDER BY total_value DESC;
